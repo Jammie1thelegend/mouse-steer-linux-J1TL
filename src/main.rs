@@ -1,5 +1,5 @@
 use evdev::{
-    AbsInfo, AbsoluteAxisCode, Device, EventSummary, EventType, InputEvent, KeyCode, RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice
+    AbsInfo, AbsoluteAxisCode, EventSummary, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice
 };
 use std::fs;
 use thiserror::Error;
@@ -9,10 +9,16 @@ use env_logger::Builder;
 use std::sync::mpsc;
 use std::thread;
 
+use std::sync::Arc;
+use std::sync::atomic::{Ordering, AtomicBool};
+
 mod configuration;
 use configuration::Config;
 
-const VJOYSTICK_NAME: &str = "mouse2joy";
+mod window;
+use window::create_window;
+
+const VJOYSTICK_NAME: &str = "mouse-steer-linux-J1TL";
 
 // virtual joystick buttons, won't be used but increase chances of joystick being recognized
 static KEYS: [KeyCode; 14] = [
@@ -33,7 +39,7 @@ static KEYS: [KeyCode; 14] = [
 ];
 
 #[derive(Error, Debug)]
-pub enum Mouse2JoyError {
+pub enum MouseSteerError {
     #[error("Failed to find a compatible input device. Make sure you are running the application with root priviledges.")]
     NoDeviceError,
 
@@ -41,7 +47,7 @@ pub enum Mouse2JoyError {
     FailedToReadInput,
 }
 
-fn main() -> Result<(), Mouse2JoyError> {
+fn main() -> Result<(), MouseSteerError> {
 
     // initialize logger
     Builder::new()
@@ -53,11 +59,18 @@ fn main() -> Result<(), Mouse2JoyError> {
     
 
     // select mouse device
-    let mouse_and_path = select_input_device(EventType::RELATIVE, RelativeAxisCode::REL_X, KeyCode::BTN_LEFT, "mouse").unwrap();
+    let mouse_and_path = select_input_device(EventType::RELATIVE, 
+        vec![RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y], 
+        vec![KeyCode::BTN_LEFT], 
+        "mouse").unwrap();
+    
     let mut mouse = mouse_and_path.0;
 
     //select keyboard device
-    let mut keyboard = select_input_device(EventType::KEY, RelativeAxisCode::REL_MISC, KeyCode::KEY_F6, "keyboard").unwrap().0;
+    let mut keyboard = select_input_device(EventType::KEY, 
+        vec![RelativeAxisCode::REL_MISC], 
+        vec![KeyCode::KEY_F5, KeyCode::KEY_F7, KeyCode::KEY_F8], 
+        "keyboard").unwrap().0;
     
 
     // set up virtual joystick
@@ -71,21 +84,21 @@ fn main() -> Result<(), Mouse2JoyError> {
     let (tx, rx) = mpsc::channel();
     let mut thr_mouse = Device::open(&mouse_and_path.1).unwrap();
     thread::spawn(move || {
-        let mut mouse2joy_active: bool = false;
+        let mut mouse_steer_active: bool = false;
         let mut quit_combo: [bool; 3] = [false, false, false];
         loop{
             for ev in keyboard.fetch_events().unwrap(){
                 match ev.destructure() {
                     //example
                     EventSummary::Key(_, KeyCode::KEY_F6, 1) => {
-                        if mouse2joy_active == true {
-                        mouse2joy_active = false;
+                        if mouse_steer_active == true {
+                        mouse_steer_active = false;
                         tx.send(false).unwrap();
-                        warn!("mouse2joy off");
+                        warn!("mouse-steer-linux-J1TL off");
                         warn!("!! Program still running, press ctrl+C to stop.");
                         continue
                     }
-                    warn!("mouse2joy on");
+                    warn!("mouse-steer-linux-J1TL on");
 
                     let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
                     let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
@@ -99,7 +112,7 @@ fn main() -> Result<(), Mouse2JoyError> {
                     let _ = thr_mouse.grab();
                     let _ = thr_mouse.ungrab(); 
 
-                    mouse2joy_active = true;
+                    mouse_steer_active = true;
                     tx.send(true).unwrap();
                         },
                     EventSummary::Key(_, KeyCode::KEY_F5, _) => {quit_combo[0] = match ev.value() {0 => false, 1 => true, _ => false}},
@@ -111,13 +124,14 @@ fn main() -> Result<(), Mouse2JoyError> {
             if quit_combo == [true, true, true] {panic!("__ ___ FORCE QUIT ___ __");}
         }
     });
+    thread::spawn(move || { create_window()});
 
     // fetch events and send them through to virtual joystick
     let min: i32 = conf.range_min();
     let max: i32 = conf.range_max();
     let mut mouse_x_pos: i32 = 0;
     let mut joystick_x_pos: i32;
-    let mut mouse2joy_active: bool = false;
+    let mut mouse_steer_active: bool = false;
 
     let mut mouse_main_emit = Device::open(&mouse_and_path.1).unwrap();
 
@@ -125,8 +139,8 @@ fn main() -> Result<(), Mouse2JoyError> {
         for ev in mouse.fetch_events().unwrap(){
                 match ev.destructure() {
                     EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, _) => {
-                        mouse2joy_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse2joy_active};
-                        if mouse2joy_active == false {continue}
+                        mouse_steer_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse_steer_active};
+                        if mouse_steer_active == false {continue}
                         mouse_x_pos += ev.value();
                         joystick_x_pos = mouse_x_pos;
 
@@ -155,11 +169,11 @@ fn main() -> Result<(), Mouse2JoyError> {
                         } */
                     },
                     EventSummary::Key(_, KeyCode::BTN_LEFT, 1) => {
-                        if mouse2joy_active == false {continue}
+                        if mouse_steer_active == false {continue}
                         
                         let _ = mouse_main_emit.grab(); 
-                        warn!("Potentially changed mouse focus while tracking mouse, mouse grabbed until mouse2joy deactivated!");
-                        while mouse2joy_active == true {mouse2joy_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse2joy_active};};
+                        warn!("Potentially changed mouse focus while tracking mouse, mouse grabbed until mouse-steer-linux-J1TL deactivated!");
+                        while mouse_steer_active == true {mouse_steer_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse_steer_active};};
                         let _ = mouse_main_emit.ungrab(); 
                     },
                     _ => {}
@@ -168,10 +182,10 @@ fn main() -> Result<(), Mouse2JoyError> {
          }
     }
 
-fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, filter_key: KeyCode, devname:&str)-> Result<(Device, String), Mouse2JoyError> {
+fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCode>, filter_keys: Vec<KeyCode>, devname:&str)-> Result<(Device, String), MouseSteerError> {
     // find all input devices that can be used as a specific type of device
 
-    let dev_input_paths: Vec<_> = fs::read_dir("/dev/input")
+    let dev_input_paths: Vec<_> = fs::read_dir("/dev/input/")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.path().into_os_string().to_str().map(String::from)).collect();
@@ -182,39 +196,100 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
         let d = Device::open(&p).ok().filter(|device| device.supported_events().contains(filter_evtype));
         match d {
             Some(d) => {
+
                 if filter_rel != RelativeAxisCode::REL_MISC {
-                    if d.supported_relative_axes().map_or(false, |keys| keys.contains(filter_rel)) == false {continue}
+                    if d.supported_relative_axes().map_or(false, |axes| axes.contains(filter_rel)) == false {continue}
                 }
-                if d.supported_keys().map_or(false, |keys| keys.contains(filter_key)) == false {continue}
+                if d.supported_keys().map_or(false, |keys| {
+                    let mut correct_keys = 0;
+                    for fk in &filter_keys {if keys.contains(*fk) {correct_keys += 1}}; // borrows then dereferences, just pleasing the compiler
+                    if correct_keys == filter_keys.len() {true}
+                    else {false}
+                    }
+                ) == false {continue}
+
                 devices.push(d); 
                 paths.push(p);
+
                 },
             _ => continue
         }
     }
     
     if devices.is_empty() {
-        error!("{}", Mouse2JoyError::NoDeviceError);
-        return Err(Mouse2JoyError::NoDeviceError);
+        error!("{}", MouseSteerError::NoDeviceError);
+        return Err(MouseSteerError::NoDeviceError);
+    }
+    if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
+
+    // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
+    if filter_rel == RelativeAxisCode::REL_MISC {
+        println!("Awaiting input to choose device, please do the following inputs on your {}: press {:?}. (Does not need to happen at the same time)", devname, filter_keys);
+    }
+    else {
+        println!("Awaiting input to choose device, please do the following inputs on your {}: move {:?}, and press {:?}. (Does not need to happen at the same time)", devname, filter_rel, filter_keys);
     }
 
-    // ask user which device to use
+    let (dftx, dfrx) = mpsc::channel(); // device found channel
+    let dev_found = Arc::new(AtomicBool::new(false));
+    for p in paths{
 
-    let mut index: usize = 1;
-    if !(devices.len() == 1) {
-        println!("Several {}s detected, please select one:", devname);
-        for (i, device) in devices.iter().enumerate() {
-            println!("{}: {}, more info: {:?}", i + 1, device.name().unwrap_or("Unknown Device"), device.input_id());
-        };
-        index = input_in_range(1, devices.len())
-    } else {
-        warn!("Only one compatible {} found!", devname);
+
+        let dftx_clone = dftx.clone();
+        let dev_found_clone = dev_found.clone();
+        let mut dev = Device::open(&p).unwrap();
+        let mut req_rel = filter_rel.clone().0;
+        let mut req_keys: Vec<KeyCode> = filter_keys.clone();
+        thread::spawn(move || {
+            let req_num = req_keys.len() as i32 + 1; // +1 is req_rel's length
+            let mut req_count = 0;
+
+            if req_rel == RelativeAxisCode::REL_MISC.0 {req_count += 1};
+
+            let path_perm = p.clone();
+
+            'thread_loop: loop {
+                for ev in dev.fetch_events().unwrap() {
+                    if dev_found_clone.load(Ordering::Acquire) == true {break 'thread_loop}
+
+
+                    let path_temp = path_perm.clone();
+                    let ev_code = ev.code();
+
+                    if ev.event_type() == EventType::RELATIVE {
+                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; println!("{:?} moved", RelativeAxisCode(req_rel)); req_rel = RelativeAxisCode::REL_MISC.0;}}
+                        
+                    }
+                    if ev.event_type() == EventType::KEY {
+                        let mut rem_req_keys: Vec<KeyCode> = vec![];
+
+                        for rk in &req_keys {
+                            if ev_code == rk.0 {req_count += 1; println!("{:?} pressed", rk); continue};
+                            rem_req_keys.push(*rk); // * dereferences
+                        }
+                        req_keys = rem_req_keys;
+                    }
+
+                    if req_count == req_num {let _ = dftx_clone.send(path_temp); break 'thread_loop}
+
+                }
+            }
+        });
+
+    }
+
+    let path: String = dfrx.recv().unwrap().to_string();
+
+    dev_found.store(true, Ordering::Release);
+    for mut d in devices {
+        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 1)]);
+        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 0)]);
     }
     
-    let input_device = devices.remove(index - 1);
-    let input_device_path = paths.remove(index - 1);
+    
+    let input_device = Device::open(&path).unwrap();
     info!("Using \"{}\" as {} input device", input_device.name().unwrap_or("Unknown Device"), devname);
-    Ok((input_device, input_device_path))
+    Ok((input_device, path))
 
 }
 
@@ -248,30 +323,6 @@ fn mouse_move_evs(x:i32, y:i32) -> [InputEvent; 4] {
     return events;
 }
 
-// ask user for a usize input within a given range
-fn input_in_range(min: usize, max: usize) -> usize {
-    let mut input = String::new();
-
-    loop {
-        input.clear();
-        std::io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
-
-        match input.trim().parse::<usize>() {
-            Ok(index) if index >= min && index <= max => {
-                return index;
-            }
-            _ => {
-                println!(
-                    "Invalid selection. Please enter a number between {} and {}",
-                    min, max
-                );
-                continue;
-            }
-        }
-    }
-}
 
 fn load_config() -> Config {
     if Config::exists() {

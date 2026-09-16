@@ -1,5 +1,5 @@
 [package]
-name = "mouse2joy"
+name = "mouse-steer-linux-J1TL"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,6 +12,11 @@ env_logger = "0.10"
 serde = { version = "1.0.216", features = ["derive"] }
 toml = "0.8.19"
 dirs = "5.0.1"
+wayland-client = "0.31.14"
+wayland-protocols = "0.32.12"
+tempfile = "3.27.0"
+wayland-server = "0.31.13"
+smithay = "0.7.0"
 
 [package.metadata]
 os = "linux"
