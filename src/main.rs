@@ -60,7 +60,7 @@ fn main() -> Result<(), MouseSteerError> {
 
     // select mouse device
     let mouse_and_path = select_input_device(EventType::RELATIVE, 
-        vec![RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y], 
+        vec![RelativeAxisCode::REL_X], 
         vec![KeyCode::BTN_LEFT], 
         "mouse").unwrap();
     
@@ -197,9 +197,14 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
         match d {
             Some(d) => {
 
-                if filter_rel != RelativeAxisCode::REL_MISC {
-                    if d.supported_relative_axes().map_or(false, |axes| axes.contains(filter_rel)) == false {continue}
-                }
+                if d.supported_relative_axes().map_or(false, |keys| {
+                    let mut correct_rels = 0;
+                    for fr in &filter_rels {if keys.contains(*fr) {correct_rels += 1}}; // borrows then dereferences, just pleasing the compiler
+                    if correct_rels == filter_rels.len() {true}
+                    else {false}
+                    }
+                ) == false {continue}
+                
                 if d.supported_keys().map_or(false, |keys| {
                     let mut correct_keys = 0;
                     for fk in &filter_keys {if keys.contains(*fk) {correct_keys += 1}}; // borrows then dereferences, just pleasing the compiler
@@ -223,11 +228,11 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
     if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
 
     // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
-    if filter_rel == RelativeAxisCode::REL_MISC {
+    if filter_rels[0] == RelativeAxisCode::REL_MISC {
         println!("Awaiting input to choose device, please do the following inputs on your {}: press {:?}. (Does not need to happen at the same time)", devname, filter_keys);
     }
     else {
-        println!("Awaiting input to choose device, please do the following inputs on your {}: move {:?}, and press {:?}. (Does not need to happen at the same time)", devname, filter_rel, filter_keys);
+        println!("Awaiting input to choose device, please do the following inputs on your {}: move {:?}, and press {:?}. (Does not need to happen at the same time)", devname, filter_rels, filter_keys);
     }
 
     let (dftx, dfrx) = mpsc::channel(); // device found channel
@@ -238,13 +243,12 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
         let dftx_clone = dftx.clone();
         let dev_found_clone = dev_found.clone();
         let mut dev = Device::open(&p).unwrap();
-        let mut req_rel = filter_rel.clone().0;
+        let mut req_rels: Vec<RelativeAxisCode> = filter_rels.clone();
         let mut req_keys: Vec<KeyCode> = filter_keys.clone();
         thread::spawn(move || {
-            let req_num = req_keys.len() as i32 + 1; // +1 is req_rel's length
+            let req_num = req_keys.len() as i32 + req_rels.len() as i32;
             let mut req_count = 0;
 
-            if req_rel == RelativeAxisCode::REL_MISC.0 {req_count += 1};
 
             let path_perm = p.clone();
 
@@ -257,7 +261,14 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
                     let ev_code = ev.code();
 
                     if ev.event_type() == EventType::RELATIVE {
-                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; println!("{:?} moved", RelativeAxisCode(req_rel)); req_rel = RelativeAxisCode::REL_MISC.0;}}
+                        
+                        let mut rem_req_rels: Vec<RelativeAxisCode> = vec![];
+
+                        for rr in &req_rels {
+                            if ev_code == rr.0 {req_count += 1; println!("{:?} moved", rr); continue};
+                            rem_req_rels.push(*rr); // * dereferences
+                        }
+                        req_rels = rem_req_rels;
                         
                     }
                     if ev.event_type() == EventType::KEY {
