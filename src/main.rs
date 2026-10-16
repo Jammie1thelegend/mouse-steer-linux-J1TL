@@ -1,13 +1,17 @@
 use evdev::{
     AbsInfo, AbsoluteAxisCode, EventSummary, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice
 };
-use std::fs;
+
 use thiserror::Error;
 use log::{info, warn, error, LevelFilter};
 use env_logger::Builder;
 
+use std::fs;
+
 use std::sync::mpsc;
 use std::thread;
+
+use std::time::Duration;
 
 use std::sync::Arc;
 use std::sync::atomic::{Ordering, AtomicBool};
@@ -15,8 +19,8 @@ use std::sync::atomic::{Ordering, AtomicBool};
 mod configuration;
 use configuration::Config;
 
-mod window;
-use window::create_window;
+//mod window;
+//use window::create_window;
 
 const VJOYSTICK_NAME: &str = "mouse-steer-linux-J1TL";
 
@@ -43,9 +47,11 @@ pub enum MouseSteerError {
     #[error("Failed to find a compatible input device. Make sure you are running the application with root priviledges.")]
     NoDeviceError,
 
-    #[error("Failed to read a mouse input")]
-    FailedToReadInput,
+    #[error("Config value out of range")]
+    ConfigValueOutOfRange,
 }
+
+
 
 fn main() -> Result<(), MouseSteerError> {
 
@@ -54,28 +60,45 @@ fn main() -> Result<(), MouseSteerError> {
         .filter_level(LevelFilter::Trace)  // This shows everything
         .init();
 
-    let conf = load_config();
-    info!("sensitivity: {}", conf.sensitivity);
+    let conf = match Config::load() {Ok(config) => {config}, Err(error) => {return Err(error)}};
+    info!("sensitivity: {}", conf.steer_sensitivity);
     
 
     // select mouse device
-    let mouse_and_path = select_input_device(EventType::RELATIVE, 
-        vec![RelativeAxisCode::REL_X], 
-        vec![KeyCode::BTN_LEFT], 
+    let mouse_and_path = select_input_device(
+        EventType::RELATIVE, 
+        vec![RelativeAxisCode::REL_X, RelativeAxisCode::REL_WHEEL], 
+        vec![KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT], 
         "mouse").unwrap();
     
     let mut mouse = mouse_and_path.0;
 
     //select keyboard device
-    let mut keyboard = select_input_device(EventType::KEY, 
+    let mut keyboard = select_input_device(
+        EventType::KEY, 
         vec![RelativeAxisCode::REL_MISC], 
         vec![KeyCode::KEY_F5, KeyCode::KEY_F7, KeyCode::KEY_F8], 
         "keyboard").unwrap().0;
     
 
     // set up virtual joystick
-    let axis_info = AbsInfo::new(conf.value(), conf.range_min(), conf.range_max(), conf.fuzz(), conf.flat(), conf.resolution());
-    let mut joystick = create_joystick(axis_info, VJOYSTICK_NAME).unwrap();
+    let abs_info_x = AbsInfo::new(
+        0, 
+        conf.raw_range_min(), 
+        conf.raw_range_max(), 
+        10, 
+        0, 
+        conf.raw_resolution());
+    
+    let abs_info_y = AbsInfo::new(
+        0, 
+        conf.raw_range_min(), 
+        conf.raw_range_max(), 
+        10, 
+        0, 
+        conf.raw_resolution());
+    
+    let mut joystick = create_joystick(abs_info_x, abs_info_y, VJOYSTICK_NAME).unwrap();
     info!("Virtual joystick created");
 
 
@@ -100,8 +123,10 @@ fn main() -> Result<(), MouseSteerError> {
                     }
                     warn!("mouse-steer-linux-J1TL on");
 
-                    let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
-                    let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
+                    let _ = thr_mouse.grab();
+                    let _ = thr_mouse.ungrab(); 
+                    //let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
+                    //let _ = thr_mouse.send_events(&mouse_move_evs(i32::MIN, i32::MIN));
                     let _ = thr_mouse.grab();
                     let _ = thr_mouse.ungrab(); 
                     let _ = thr_mouse.send_events(&mouse_move_evs(0, 0));
@@ -110,7 +135,9 @@ fn main() -> Result<(), MouseSteerError> {
                     let _ = thr_mouse.send_events(&mouse_move_evs(0, 0));
                     let _ = thr_mouse.send_events(&mouse_move_evs(0, 0));
                     let _ = thr_mouse.grab();
-                    let _ = thr_mouse.ungrab(); 
+                    let _ = thr_mouse.ungrab();
+
+                    thread::sleep(Duration::from_millis(100));
 
                     mouse_steer_active = true;
                     tx.send(true).unwrap();
@@ -124,63 +151,172 @@ fn main() -> Result<(), MouseSteerError> {
             if quit_combo == [true, true, true] {panic!("__ ___ FORCE QUIT ___ __");}
         }
     });
-    thread::spawn(move || { create_window()});
+    //thread::spawn(move || { create_window()});
 
     // fetch events and send them through to virtual joystick
-    let min: i32 = conf.range_min();
-    let max: i32 = conf.range_max();
-    let mut mouse_x_pos: i32 = 0;
-    let mut joystick_x_pos: i32;
-    let mut mouse_steer_active: bool = false;
+    let steer_deadzone: i32 = conf.steer_deadzone_calculated();
+    let brake_deadzone: i32 = conf.brake_deadzone_calculated();
 
-    let mut mouse_main_emit = Device::open(&mouse_and_path.1).unwrap();
+    let steer_min: i32 = conf.raw_range_min();
+    let steer_max: i32 = conf.raw_range_max();
+    let brake_min: i32 = conf.raw_range_min();
+    //let brake_max: i32 = conf.calculated_half_brake_range();
+
+    let steer_multiplier: i32 = conf.steer_multiplier();
+    let brake_multiplier: i32 = conf.brake_multiplier();
+
+    let mut joystick_x_pos: i32 = 0;
+    let mut joystick_y_pos: i32 = 0;
+
+    let mut mouse_steer_active: bool = false;
+    let mut braking_active: bool = false;
 
     loop {
+        if mouse_steer_active == true {let _ = mouse.grab();}
+        if mouse_steer_active == false {let _ = mouse.ungrab();}
+
         for ev in mouse.fetch_events().unwrap(){
                 match ev.destructure() {
                     EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, _) => {
                         mouse_steer_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse_steer_active};
-                        if mouse_steer_active == false {continue}
-                        mouse_x_pos += ev.value();
-                        joystick_x_pos = mouse_x_pos;
+                        if mouse_steer_active == false {joystick_x_pos = 0; continue}
 
-                        if joystick_x_pos < min {
-                            let _ = mouse_main_emit.send_events(&mouse_move_evs(min - joystick_x_pos, 0));
-                            joystick_x_pos = min
+                        joystick_x_pos += ev.value() * steer_multiplier;
+
+
+                        if joystick_x_pos < steer_min{
+                            joystick_x_pos = steer_min
                         }
-                        if joystick_x_pos > max {
-                            let _ = mouse_main_emit.send_events(&mouse_move_evs(max - joystick_x_pos, 0));
-                            joystick_x_pos = max
+                        if joystick_x_pos > steer_max{
+                            joystick_x_pos = steer_max
                         }
+
+                        if joystick_x_pos < steer_deadzone && joystick_x_pos > -steer_deadzone {continue}
+
+
                         let ev = InputEvent::new(
                             EventType::ABSOLUTE.0,
                             AbsoluteAxisCode::ABS_X.0,
                             joystick_x_pos,
                         );
                         let _ = joystick.emit(&[ev]);
-                        /* match joystick.emit(&[ev]) {
-                          Ok(_) => {
-                            info!("Moved joystick position to {}", joystick_x_pos);
-                          },
-                          Err(e) => {
-                            warn!("Failed to emit joystick event: {}", e);
-                            continue;
-                          }
-                        } */
                     },
-                    EventSummary::Key(_, KeyCode::BTN_LEFT, 1) => {
+                    EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, _) => {
+                        mouse_steer_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse_steer_active};
+                        if mouse_steer_active == false {joystick_y_pos = 0; continue}
+                        if braking_active == false {joystick_y_pos = 0; continue}
+                        
+                        joystick_y_pos += ev.value() * brake_multiplier;
+
+                        if joystick_y_pos < brake_min {
+                            joystick_y_pos = brake_min
+                        }
+                        if joystick_y_pos > 0 {
+                            joystick_y_pos = 0
+                        }
+
+                        if joystick_y_pos < brake_deadzone && joystick_y_pos > -brake_deadzone {continue}
+
+
+                        let emitted_ev = InputEvent::new(
+                            EventType::ABSOLUTE.0,
+                            AbsoluteAxisCode::ABS_RY.0,
+                            joystick_y_pos,
+                        );
+                        let _ = joystick.emit(&[emitted_ev]);
+                    },
+                    EventSummary::Key(_, KeyCode::BTN_RIGHT, _) => {
                         if mouse_steer_active == false {continue}
                         
-                        let _ = mouse_main_emit.grab(); 
-                        warn!("Potentially changed mouse focus while tracking mouse, mouse grabbed until mouse-steer-linux-J1TL deactivated!");
-                        while mouse_steer_active == true {mouse_steer_active = match rx.try_recv() {Ok(bool) => bool, Err(_e) => mouse_steer_active};};
-                        let _ = mouse_main_emit.ungrab(); 
+                        if ev.value() == 0 {
+
+                            braking_active = false;
+
+                            let emitted_ev = InputEvent::new(
+                                EventType::ABSOLUTE.0,
+                                AbsoluteAxisCode::ABS_RY.0,
+                                0,
+                            );
+                            let _ = joystick.emit(&[emitted_ev]);
+                        }
+
+                        else if ev.value() > 0 {
+                            if braking_active == false {
+                                
+                                braking_active = true;
+
+                                joystick_y_pos = (brake_min*80)/100;
+
+                                let emitted_ev = InputEvent::new(
+                                    EventType::ABSOLUTE.0,
+                                    AbsoluteAxisCode::ABS_RY.0,
+                                    joystick_y_pos,
+                                );
+                            let _ = joystick.emit(&[emitted_ev]);
+                            }
+                        }
                     },
+                    EventSummary::Key(_, KeyCode::BTN_LEFT, _) => {
+                        if mouse_steer_active == false {continue}
+
+                        let mut emitted_ev = InputEvent::new(
+                            EventType::ABSOLUTE.0,
+                            AbsoluteAxisCode::ABS_Z.0,
+                            100,
+                        );
+
+                        if ev.value() == 0 {
+                            emitted_ev = InputEvent::new(EventType::ABSOLUTE.0,
+                            AbsoluteAxisCode::ABS_Z.0,
+                            0
+                            );
+                        }
+
+                        let _ = joystick.emit(&[emitted_ev]);
+                    }
+
                     _ => {}
                 }
             }
          }
     }
+
+fn create_joystick(abs_info_x: AbsInfo, abs_info_y: AbsInfo, name: &str) -> std::io::Result<VirtualDevice> {
+    let abs_steer = UinputAbsSetup::new(AbsoluteAxisCode::ABS_X, abs_info_x);
+    let abs_brake = UinputAbsSetup::new(AbsoluteAxisCode::ABS_RY, abs_info_y);
+
+    let abs_accelerator = UinputAbsSetup::new(AbsoluteAxisCode::ABS_Z, AbsInfo::new(0, 0, 100, 0, 0, 100));
+
+    let dummy_1 = UinputAbsSetup::new(AbsoluteAxisCode::ABS_Y, abs_info_x);
+    let dummy_2 = UinputAbsSetup::new(AbsoluteAxisCode::ABS_RX, abs_info_y);
+    let dummy_3 = UinputAbsSetup::new(AbsoluteAxisCode::ABS_RZ, AbsInfo::new(0, 0, 1000, 0, 0, 1000));
+
+    let mut keys = evdev::AttributeSet::new();
+    for button in KEYS {
+        keys.insert(button)
+    }
+
+    let joystick = VirtualDevice::builder()?
+        .name(name)
+        .with_absolute_axis(&abs_steer)?
+        .with_absolute_axis(&abs_brake)?
+        .with_absolute_axis(&abs_accelerator)?
+        .with_absolute_axis(&dummy_1)?
+        .with_absolute_axis(&dummy_2)?
+        .with_absolute_axis(&dummy_3)?
+        .with_keys(&keys)?
+        .build()?;
+
+    Ok(joystick)
+}
+
+fn mouse_move_evs(x:i32, y:i32) -> [InputEvent; 2] {
+    let event_x = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, x);
+    let event_y = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, y);
+
+    let events: [InputEvent; 2] = [event_x, event_y];
+    return events;
+}
 
 fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCode>, filter_keys: Vec<KeyCode>, devname:&str)-> Result<(Device, String), MouseSteerError> {
     // find all input devices that can be used as a specific type of device
@@ -199,11 +335,13 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
 
                 if d.supported_relative_axes().map_or(false, |keys| {
                     let mut correct_rels = 0;
-                    for fr in &filter_rels {if keys.contains(*fr) {correct_rels += 1}}; // borrows then dereferences, just pleasing the compiler
+
+                    for fr in &filter_rels {if keys.contains(*fr) {correct_rels += 1}} // borrows then dereferences, just pleasing the compiler
+                    
                     if correct_rels == filter_rels.len() {true}
                     else {false}
                     }
-                ) == false {continue}
+                ) == false {if filter_rels[0] == RelativeAxisCode::REL_MISC {} else {continue;}}
                 
                 if d.supported_keys().map_or(false, |keys| {
                     let mut correct_keys = 0;
@@ -225,6 +363,7 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
         error!("{}", MouseSteerError::NoDeviceError);
         return Err(MouseSteerError::NoDeviceError);
     }
+
     if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
 
     // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
@@ -249,6 +388,7 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
             let req_num = req_keys.len() as i32 + req_rels.len() as i32;
             let mut req_count = 0;
 
+            if req_rels[0] == RelativeAxisCode::REL_MISC {req_count += 1}
 
             let path_perm = p.clone();
 
@@ -265,9 +405,10 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
                         let mut rem_req_rels: Vec<RelativeAxisCode> = vec![];
 
                         for rr in &req_rels {
-                            if ev_code == rr.0 {req_count += 1; println!("{:?} moved", rr); continue};
+                            if ev_code == rr.0 {req_count += 1; println!("{:?} moved", rr);  continue};
                             rem_req_rels.push(*rr); // * dereferences
                         }
+
                         req_rels = rem_req_rels;
                         
                     }
@@ -275,11 +416,12 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
                         let mut rem_req_keys: Vec<KeyCode> = vec![];
 
                         for rk in &req_keys {
-                            if ev_code == rk.0 {req_count += 1; println!("{:?} pressed", rk); continue};
+                            if ev_code == rk.0 {req_count += 1; println!("{:?} pressed", rk);  continue};
                             rem_req_keys.push(*rk); // * dereferences
                         }
                         req_keys = rem_req_keys;
                     }
+                    
 
                     if req_count == req_num {let _ = dftx_clone.send(path_temp); break 'thread_loop}
 
@@ -305,50 +447,4 @@ fn select_input_device(filter_evtype: EventType, filter_rels: Vec<RelativeAxisCo
 }
 
 
-fn create_joystick(abs_info: AbsInfo, name: &str) -> std::io::Result<VirtualDevice> {
-    let abs_x = UinputAbsSetup::new(AbsoluteAxisCode::ABS_X, abs_info);
-    let abs_y = UinputAbsSetup::new(AbsoluteAxisCode::ABS_Y, abs_info);
 
-    let mut keys = evdev::AttributeSet::new();
-    for button in KEYS {
-        keys.insert(button)
-    }
-
-    let joystick = VirtualDevice::builder()?
-        .name(name)
-        .with_absolute_axis(&abs_x)?
-        .with_absolute_axis(&abs_y)?
-        .with_keys(&keys)?
-        .build()?;
-
-    Ok(joystick)
-}
-
-fn mouse_move_evs(x:i32, y:i32) -> [InputEvent; 4] {
-    let event_x = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, x);
-    let event_y = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, y);
-
-    let event_sync = InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0);
-    
-    let events: [InputEvent; 4] = [event_x, event_sync, event_y, event_sync];
-    return events;
-}
-
-
-fn load_config() -> Config {
-    if Config::exists() {
-      match Config::load() {
-        Ok(conf) => {
-          info!("Using configuration file {}", Config::path());
-          conf
-        }
-        Err(_) => {
-          warn!("Problem loading the configuration, using default");
-          Config::default()
-        }
-      }
-    } else {
-      info!("No configuration found, using default");
-      Config::default()
-    }
-}

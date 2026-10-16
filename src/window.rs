@@ -29,8 +29,6 @@ pub fn create_window() {
         configured: false,
     };
 
-    println!("Starting the example window app");
-
     while state.running {
         event_queue.blocking_dispatch(&mut state).unwrap();
     }

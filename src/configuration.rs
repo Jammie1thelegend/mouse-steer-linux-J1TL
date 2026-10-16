@@ -1,96 +1,109 @@
-use serde::{Serialize, Deserialize};
-use toml;
-use toml::de::Error;
+use std::fs;
+use serde::Deserialize;
 
-const BASE_RANGE: i32 = 1024;
-const BASE_DEFAULT_POSITION: i32 = 0;
-// WARN: can crash program
+use log::{error};
 
-#[derive(Serialize, Deserialize)]
+use crate::MouseSteerError;
+
+
+
+#[derive(Deserialize)]
+#[derive(Debug)]
 pub struct Config {
-  pub sensitivity: f32,
-  pub dead_zone: i32,
-  pub flat: i32,
-  pub gui: bool,
+    pub resolution: i32,
+    pub steer_sensitivity: f32,
+    pub brake_sensitivity: f32,
+    pub steer_deadzone: f32,
+    pub brake_deadzone: f32,
 }
 
-
-
-
-
 impl Config {
-  pub fn default() -> Self {
+    pub fn load_default() -> Self {
     Self {
-      sensitivity: 1.0,
-      dead_zone: 0,
-      flat: 0,
-      gui: true,
+        resolution: 1024,
+        steer_sensitivity: 1.0,
+        brake_sensitivity: 3.0,
+        steer_deadzone: 1.0,
+        brake_deadzone: 0.0,
+        }
     }
-  }
-
-  pub fn exists() -> bool {
-    match dirs::config_dir() {
-      Some(_) => {
-        return std::path::Path::new(&Config::path()).exists()
-      }
-      std::prelude::v1::None => {
-        return false
-      }
-    }
-  }
-
-  pub fn path() -> String {
-
-    // Get the SUDO_USER environment variable to find the actual user
-    let user = std::env::var("SUDO_USER").unwrap_or_else(|_| String::from("root"));
-
-    
-    // If running as sudo, construct path using the real user's home
-    if user != "root" {
-        format!("/home/{}/.config/mouse2joy/config.toml", user)
-    } else {
-        // Fallback to root's config if not running through sudo
-        dirs::config_dir()
+    pub fn load() -> Result<Self, MouseSteerError> {
+        let path = dirs::config_dir()
             .unwrap_or_default()
-            .join("mouse2joy")
+            .join("mouse-steer-linux-J1TL")
             .join("config.toml")
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
+
+        let default_config =   
+"resolution = 1024            # Base width of steering and braking range in pixels (Advanced users only)
+steer_sensitivity = 1.0       # Steering sensitivity (Bigger = more sensitivity)
+brake_sensitivity = 3.0       # Brake sensitivity    (Bigger = more sensitivity)
+steer_deadzone = 1.0         # Steering deadzone
+brake_deadzone = 0.0         # Braking deadzone";
+
+        match fs::File::open(&path) {
+            Ok(file) => {file}, 
+            Err(_) => {fs::write(&path, default_config).unwrap(); fs::File::open(&path).unwrap()}
+        };
+
+        let config_raw = match fs::read_to_string(&path) {
+            Ok(raw) => {raw}, 
+            Err(_) => {fs::write(&path, default_config).unwrap(); fs::read_to_string(&path).unwrap()}
+        };
+
+    // add error handling
+        let config: Self = match toml::from_str(&config_raw) {
+            Ok(parsed) => {parsed},
+            Err(_) => {Config::load_default()}
+        };
+
+        if config.steer_deadzone > 100.0 || config.steer_deadzone < 0.0 {
+            error!("steering deadzone ({}) too big/ too small!", config.steer_deadzone);
+            return Err(MouseSteerError::ConfigValueOutOfRange)
+        }
+        if config.brake_deadzone > 100.0 || config.brake_deadzone < 0.0 {
+            error!("brake deadzone ({}) too big/ too small!", config.brake_deadzone);
+            return Err(MouseSteerError::ConfigValueOutOfRange)
+        }
+
+
+        return Ok(config)
     }
-  }
 
-  // WARN: Can make program crash
-  pub fn load() -> Result<Config,Error> {
-    let file = Config::path();
-    let contents = std::fs::read_to_string(file).unwrap();
-    toml::from_str(&contents)
-  }
+    pub fn raw_resolution(&self) -> i32 {
+        i16::MAX as i32 * 2
+    }
+    pub fn raw_range_max(&self) -> i32 {
+        self.raw_resolution()/2
+    }
+    pub fn raw_range_min(&self) -> i32 {
+        -self.raw_resolution()/2
+    }
 
-  fn range(&self) -> i32 {
-    ((BASE_RANGE as f32/self.sensitivity)/2.0) as i32
-  }
+    pub fn config_half_steer_range(&self) -> i32 {
+        ((self.resolution as f32/self.steer_sensitivity)/2.0) as i32
+    }
+    pub fn config_half_brake_range(&self) -> i32 {
+        ((self.resolution as f32/self.brake_sensitivity)/40.0) as i32
+    }
+    pub fn steer_multiplier(&self) -> i32 {
+        self.raw_range_max() / self.config_half_steer_range()
+    }
+    pub fn brake_multiplier(&self) -> i32 {
+        self.raw_range_max() / self.config_half_brake_range()
+    }
+/*     pub fn calculated_half_steer_range(&self) -> i32 {
+        self.steer_multiplier() * (self.config_half_steer_range() / self.steer_multiplier())
+    }
+    pub fn calculated_half_brake_range(&self) -> i32 {
+        self.brake_multiplier() * (self.config_half_brake_range() / self.brake_multiplier())
+    } */
+    pub fn steer_deadzone_calculated(&self) -> i32 {
+        (self.steer_deadzone/ 100.0 * (self.raw_range_max() as f32)) as i32
+    }
+    pub fn brake_deadzone_calculated(&self) -> i32 {
+        (self.brake_deadzone/ 100.0 * (self.raw_range_max() as f32)) as i32
+    }
 
-  pub fn range_min(&self) -> i32 {
-    -self.range()
-  }
-
-  pub fn range_max(&self) -> i32 {
-    self.range()
-  }
-
-  pub fn fuzz(&self) -> i32 {
-    self.dead_zone
-  }
-
-  pub fn value(&self) -> i32 {
-    BASE_DEFAULT_POSITION
-  }
-
-  pub fn resolution(&self) -> i32 {
-    BASE_RANGE
-  }
-
-  pub fn flat(&self) -> i32 {
-    self.flat
-  }
 }
